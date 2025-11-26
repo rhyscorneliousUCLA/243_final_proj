@@ -101,6 +101,8 @@ def trainModel(args):
     # --train--
     testLoss = []
     testCER = []
+    testCustomWeightedCER = []
+    testCorrelationCER = []
     startTime = time.time()
     for batch in range(args["nBatch"]):
         model.train()
@@ -149,6 +151,8 @@ def trainModel(args):
                 model.eval()
                 allLoss = []
                 total_edit_distance = 0
+                total_corr_distance = 0
+                total_custom_weighted_distance = 0
                 total_seq_length = 0
                 for X, y, X_len, y_len, testDayIdx in testLoader:
                     X, y, X_len, y_len, testDayIdx = (
@@ -191,12 +195,35 @@ def trainModel(args):
                         total_edit_distance += matcher.distance()
                         total_seq_length += len(trueSeq)
 
+                        # NEW CER (phoneme-weighted)
+                        true_phonemes = [safe_idx2phoneme(i) for i in trueSeq if int(i) != 0]
+                        decoded_phonemes = [safe_idx2phoneme(i) for i in decodedSeq if int(i) != 0]
+
+                        corr_dist = phoneme_edit_distance(true_phonemes, decoded_phonemes)
+                        total_corr_distance += corr_dist
+
+                        # NEW: generic weighted edit distance on indices (or phonemes)
+                        custom_wdist = weighted_edit_distance(
+                            trueSeq.tolist(), decodedSeq.tolist(),
+                            ins_cost=1.25,
+                            del_cost=0.75,
+                            sub_cost=1.0,
+                        )
+                        total_custom_weighted_distance += custom_wdist
+
                 avgDayLoss = np.sum(allLoss) / len(testLoader)
                 cer = total_edit_distance / total_seq_length
+                correlationCER = total_corr_distance / total_seq_length
+                customWeightedCER = total_custom_weighted_distance / total_seq_length 
 
                 endTime = time.time()
                 print(
-                    f"batch {batch}, ctc loss: {avgDayLoss:>7f}, cer: {cer:>7f}, time/batch: {(endTime - startTime)/100:>7.3f}"
+                    f"batch {batch}, "
+                    f"ctc loss: {avgDayLoss:>7f}, "
+                    f"cer: {cer:>7f}, "
+                    f"correlationCER: {correlationCER:>7f}, "
+                    f"customWeightedCER: {customWeightedCER:>7f}, "
+                    f"time/batch: {(endTime - startTime)/100:>7.3f}"
                 )
                 startTime = time.time()
 
@@ -204,13 +231,137 @@ def trainModel(args):
                 torch.save(model.state_dict(), args["outputDir"] + "/modelWeights")
             testLoss.append(avgDayLoss)
             testCER.append(cer)
+            testCorrelationCER.append(correlationCER)
+            testCustomWeightedCER.append(customWeightedCER)
 
             tStats = {}
             tStats["testLoss"] = np.array(testLoss)
             tStats["testCER"] = np.array(testCER)
+            tStats["testCorrelationCER"] = np.array(testCorrelationCER)
+            tStats["testCustomWeightedCER"] = np.array(testCustomWeightedCER)
 
             with open(args["outputDir"] + "/trainingStats", "wb") as file:
                 pickle.dump(tStats, file)
+
+
+PHONE_DEF = [
+    'AA', 'AE', 'AH', 'AO', 'AW',
+    'AY', 'B',  'CH', 'D', 'DH',
+    'EH', 'ER', 'EY', 'F', 'G',
+    'HH', 'IH', 'IY', 'JH', 'K',
+    'L', 'M', 'N', 'NG', 'OW',
+    'OY', 'P', 'R', 'S', 'SH',
+    'T', 'TH', 'UH', 'UW', 'V',
+    'W', 'Y', 'Z', 'ZH'
+]
+PHONE_DEF_SIL = PHONE_DEF + ['SIL']
+
+# Their code stores labels as phoneToId(p) + 1
+# -> 1..len(PHONE_DEF_SIL) are phonemes, 0 is padding/blank
+IDX2PHONEME = {i + 1: p for i, p in enumerate(PHONE_DEF_SIL)}
+IDX2PHONEME[0] = "<BLANK>"  # matches CTC blank=0
+
+def safe_idx2phoneme(i: int) -> str:
+    return IDX2PHONEME.get(int(i), "UNK")
+
+
+def phoneme_edit_distance(a, b,
+                          ins_cost=1,
+                          del_cost=1,
+                          sub_cost=1,
+                          low_sub_cost=0.5):
+    """
+    Compute weighted edit distance between phoneme sequences a and b.
+    Substitution cost is reduced if both phonemes belong to the same
+    phoneme block (place/manner group).
+    """
+    # 1) Define phoneme groups
+    PHONEME_GROUPS = [
+        # Stops
+        {'P', 'B'}, {'T', 'D'}, {'K', 'G'},
+        # Fricatives
+        {'F', 'V'},
+        {'TH', 'DH'},
+        {'S', 'Z'},
+        {'SH', 'ZH'},
+        {'HH'},
+        # Affricates
+        {'CH', 'JH'},
+        # Nasals
+        {'M'}, {'N'}, {'NG'},
+        # Liquids
+        {'L'}, {'R'},
+        # Glides
+        {'W'}, {'Y'},
+        # Vowels (treat all the same group)
+        {'AA','AE','AH','AO','AW','AY','EH','ER','EY',
+         'IH','IY','OW','OY','UH','UW'}
+    ]
+
+    # 2) Build phoneme → group mapping
+    PHONEME2GROUP = {}
+    for idx, group in enumerate(PHONEME_GROUPS):
+        for ph in group:
+            PHONEME2GROUP[ph] = idx
+
+    def same_group(x, y):
+        return PHONEME2GROUP.get(x) == PHONEME2GROUP.get(y)
+
+    # 3) DP for weighted edit distance
+    n, m = len(a), len(b)
+    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
+
+    for i in range(1, n + 1):
+        dp[i][0] = i * del_cost
+    for j in range(1, m + 1):
+        dp[0][j] = j * ins_cost
+
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            if a[i - 1] == b[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1]
+            else:
+                sub_c = low_sub_cost if same_group(a[i - 1], b[j - 1]) else sub_cost
+                dp[i][j] = min(
+                    dp[i - 1][j] + del_cost,   # deletion
+                    dp[i][j - 1] + ins_cost,   # insertion
+                    dp[i - 1][j - 1] + sub_c   # substitution
+                )
+
+    return dp[n][m]
+
+
+def weighted_edit_distance(a, b, ins_cost=1.25, del_cost=0.75, sub_cost=1.0):
+    """
+    Compute weighted edit distance between sequences a and b.
+    a, b: sequences (list, tuple, or string)
+    ins_cost: cost of insertion
+    del_cost: cost of deletion
+    sub_cost: cost of substitution (when elements differ)
+    """
+    n, m = len(a), len(b)
+    # dp[i][j] = cost to transform a[:i] into b[:j]
+    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
+
+    # base cases: from empty to prefix
+    for i in range(1, n + 1):
+        dp[i][0] = i * del_cost
+    for j in range(1, m + 1):
+        dp[0][j] = j * ins_cost
+
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            if a[i - 1] == b[j - 1]:
+                # no cost if same symbol
+                dp[i][j] = dp[i - 1][j - 1]
+            else:
+                dp[i][j] = min(
+                    dp[i - 1][j] + del_cost,         # delete a[i-1]
+                    dp[i][j - 1] + ins_cost,         # insert b[j-1]
+                    dp[i - 1][j - 1] + sub_cost,     # substitute
+                )
+
+    return dp[n][m]
 
 
 def loadModel(modelDir, nInputLayers=24, device="cuda"):
