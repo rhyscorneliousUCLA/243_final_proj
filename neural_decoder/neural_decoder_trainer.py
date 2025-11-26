@@ -268,7 +268,7 @@ def safe_idx2phoneme(i: int) -> str:
 def phoneme_edit_distance(a, b,
                           ins_cost=1,
                           del_cost=1,
-                          sub_cost=1,
+                          sub_cost=1.5,
                           low_sub_cost=0.5):
     """
     Compute weighted edit distance between phoneme sequences a and b.
